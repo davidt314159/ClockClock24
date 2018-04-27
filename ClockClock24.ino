@@ -59,4 +59,8 @@ void step(int numSteps){
 
 void portWrite(int addr, int output){
 }
+<<<<<<< HEAD
 
+=======
+
+>>>>>>> 60a1fbb6461c48fa6e217904da7523bb5cd0cde5
