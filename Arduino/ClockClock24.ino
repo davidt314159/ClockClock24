@@ -1,11 +1,17 @@
 #include <stdlib.h>
 #include <limits.h>
+#include <math.h>
 #include <Wire.h>
 #include "RTClib.h"
 
-RTC_DS3231 rtc;
+//Number of 4-step cycles in each 1/8 clock 
+const int eigthCycles = 55;
 
-const double clockRatio;
+//Red gear: 13 teeth
+//Middle gear: 45 teeth outside, 10 teeth inside
+//Minute hand: 15 teeth
+//Hour hand: 40 teeth
+//(13/15) * 64 4-step cycles per 1/8 revolution ~= 55.467 steps
 
 //Number of 1/8 hour intervals after 12:00
 const byte targetPositions[10][6] = {
@@ -26,6 +32,12 @@ int error[4][6] = {
     {0, 0, 0, 0, 0, 0}, //minutes tens
     {0, 0, 0, 0, 0, 0} //minutes ones
 };
+int change[4][6] = {
+    {0, 0, 0, 0, 0, 0}, //hours tens
+    {0, 0, 0, 0, 0, 0}, //hours ones
+    {0, 0, 0, 0, 0, 0}, //minutes tens
+    {0, 0, 0, 0, 0, 0} //minutes ones
+}
 byte prevHour;
 byte prevMinute;
 byte currHour;
@@ -33,6 +45,7 @@ byte currMinute;
 byte digitsChanged;
 bool prevForward;
 bool forward;
+RTC_DS3231 rtc;
 DateTime now;
 
 void setup() {
@@ -54,6 +67,9 @@ void setup() {
         Wire.beginTransmission(0x20 + addr);
         Wire.write(0x00); // IODIRA register
         Wire.write(0x00); // set all of port A to outputs
+        Wire.endTransmission();
+
+        Wire.beginTransmission(0x20 + addr);
         Wire.write(0x01); // IODIRB register
         Wire.write(0x00); // set all of port B to outputs
         Wire.endTransmission();
@@ -73,21 +89,62 @@ void loop() {
         if (currMinute/10 != prevMinute/10) digitsChanged += (1 << 2);
         if (currMinute%10 != prevMinute%10) digitsChanged += (1 << 3);
 
-        //Update error
+        //Determine direction of movement
         forward = (maxError(error, digitsChanged) <= 0);
-        for (int i = 0; i < 6; i++){
-            error[0][i] += (getDiff(forward, targetPositions[currHour/10][i], targetPositions[prevHour/10][i]));
-            error[1][i] += (getDiff(forward, targetPositions[currHour%10][i], targetPositions[prevHour%10][i]));
-            error[2][i] += (getDiff(forward, targetPositions[currMinute/10][i], targetPositions[prevMinute/10][i]));
-            error[3][i] += (getDiff(forward, targetPositions[currMinute%10][i], targetPositions[prevMinute%10][i]));
-        }
-
-        //Pick up slack in clock mechanisms
-        if (forward != prevForward){
-            fixSlack(forward);
+        
+        //Calculate change and update error
+        for (byte i = 0; i < 6; i++){
+            change[0][i] = (getDiff(targetPositions[currHour/10][i], targetPositions[prevHour/10][i]));
+            error[0][i] += change[0][i];
+            change[0][i] = abs(change[0][i]) * eigthCycles;
+            
+            change[1][i] = (getDiff(targetPositions[currHour%10][i], targetPositions[prevHour%10][i]));
+            error[1][i] += change[1][i];
+            change[1][i] = abs(change[1][i]) * eigthCycles;
+            
+            change[2][i] = (getDiff(targetPositions[currMinute/10][i], targetPositions[prevMinute/10][i]));
+            error[2][i] += change[2][i];
+            change[2][i] = abs(change[2][i]) * eigthCycles;
+            
+            change[3][i] = (getDiff(targetPositions[currMinute%10][i], targetPositions[prevMinute%10][i]));
+            error[3][i] += change[3][i];
+            change[3][i] = abs(change[3][i]) * eigthCycles;
         }
 
         //Move hands
+        if (forward){
+            for (int cycle = maxCount(change); cycle > 0; cycle--){
+                for (byte digit = 0; digit < 4; digit++){
+                    for (byte board = 0; board < 3; board++){
+                        byte bitmask = 0;
+                        if (change[digit][2*board] <= cycle) bitmask = bitmask | 0b00001111;
+                        if (change[digit][2*board+1] <= cycle) bitmask = bitmask | 0b11110000;
+                        if (bitmask != 0){ // complete one cycle
+                            for (int i = 0; i < 4; i++){
+                                portWrite(0x20 + 3*(digit/2) + board, 0x14 + (digit%2), bitmask & (0b00010001 << i));
+                            }
+                        }
+                    }
+                }
+                delay(5);
+            }
+        } else {
+            for (int cycle = maxCount(change); cycle > 0; cycle--){
+                for (byte digit = 0; digit < 4; digit++){
+                    for (byte board = 0; board < 3; board++){
+                        byte bitmask = 0;
+                        if (change[digit][2*board] <= cycle) bitmask = bitmask | 0b00001111;
+                        if (change[digit][2*board+1] <= cycle) bitmask = bitmask | 0b11110000;
+                        if (bitmask != 0){ // complete one cycle
+                            for (int i = 0; i < 4; i++){
+                                portWrite(0x20 + 3*(digit/2) + board, 0x14 + (digit%2), bitmask & (0b10001000 >> i));
+                            }
+                        }
+                    }
+                }
+                delay(5);
+            }
+        }
         
 
         prevHour = currHour;
@@ -98,30 +155,14 @@ void loop() {
     delay(1000);
 }
 
-void step(int numSteps) {
-    //tens digit
-    for (int addr = 0x20; addr <= 0x22; addr++) {
-
-    }
-
-    Wire.beginTransmission(0x20);
-    Wire.write(0x14);
-    Wire.write(0);
+void portWrite(byte hardwareAddr, byte registerAddr, byte data) {
+    Wire.beginTransmission(hardwareAddr);
+    Wire.write(registerAddr); 
+    Wire.write(data);
     Wire.endTransmission();
 }
 
-void portWrite(int addr, int port, int output) {
-    Wire.beginTransmission(addr);
-    Wire.write(0x14 + port); // OLATA / OLATB register
-    Wire.write(output);
-    Wire.endTransmission();
-}
-
-void fixSlack(){
-    
-}
-
-int getDiff(bool forward, int current, int prev){
+int getDiff(int current, int prev){
     if (forward){
         return current - prev >= 0 ? current - prev : current - prev + 96;
     } else {
@@ -132,12 +173,24 @@ int getDiff(bool forward, int current, int prev){
 int maxError(int** error, byte digitsChanged){
     int max = INT_MIN;
     byte i, j;
-    for (i = 0; i <= 4; i++){
+    for (i = 0; i < 4; i++){
         if (digitsChanged & (1 << i) > 0){ //binary represents which digits are changing
-            for (j = 0; j <= 6; j++){
+            for (j = 0; j < 6; j++){
                 if (abs(error[i][j]) > abs(max)){
                     max = error[i][j];
                 }
+            }
+        }
+    }
+    return max;
+}
+
+int maxCount(int** count){
+    int max = INT_MIN;
+    for (byte i = 0; i < 4; i++){
+        for (byte j = 0; j < 6; j++){
+            if (count[i][j] > max){
+                max = count[i][j];
             }
         }
     }
